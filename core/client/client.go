@@ -54,6 +54,21 @@ func NewClient(config *Config) (Client, *HandshakeInfo, error) {
 	return c, info, nil
 }
 
+func NewClientWithConnectionIDGenerator(config *Config, connectionIDGenerator quic.ConnectionIDGenerator) (Client, *HandshakeInfo, error) {
+	if err := config.verifyAndFill(); err != nil {
+		return nil, nil, err
+	}
+	c := &clientImpl{
+		config:                config,
+		connectionIDGenerator: connectionIDGenerator,
+	}
+	info, err := c.connect()
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, info, nil
+}
+
 type clientImpl struct {
 	config *Config
 
@@ -62,6 +77,8 @@ type clientImpl struct {
 	conn    *quic.Conn
 
 	udpSM *udpSessionManager
+
+	connectionIDGenerator quic.ConnectionIDGenerator
 }
 
 func (c *clientImpl) connect() (*HandshakeInfo, error) {
@@ -90,7 +107,15 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		OmitMaxDatagramFrameSize:       true,
 		DisablePathManager:             true,
 	}
-	tr := &quic.Transport{Conn: pktConn}
+
+	tr := &quic.Transport{
+		Conn: pktConn,
+	}
+
+	if c.connectionIDGenerator != nil {
+		tr.ConnectionIDGenerator = c.connectionIDGenerator
+	}
+
 	// Prepare RoundTripper
 	var conn *quic.Conn
 	rt := &http3.Transport{
