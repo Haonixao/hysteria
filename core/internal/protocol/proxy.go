@@ -177,17 +177,26 @@ func (m *UDPMessage) Size() int {
 }
 
 func (m *UDPMessage) Serialize(buf []byte) int {
-	padLen := uint64(0)
-	if len(m.Data) < 1100 { // Only add padding if packet is not near MTU
-		padLen = uint64(rand.IntN(65)) // 0-64 bytes of padding
+	headerSize := m.HeaderSize()
+	dataLen := len(m.Data)
+	
+	// Базовый размер без паддинга: заголовок + 1 байт (PaddingLen varint) + данные
+	baseSize := headerSize + 1 + dataLen
+	
+	if len(buf) < baseSize {
+		return -1
 	}
 
-	headerSize := m.HeaderSize()
-	paddingVarintLen := int(quicvarint.Len(padLen))
-	
-	totalSize := headerSize + paddingVarintLen + int(padLen) + len(m.Data)
-	if len(buf) < totalSize {
-		return -1
+	// Вычисляем максимально возможный паддинг
+	// Оставляем 2 байта запаса для безопасности
+	maxPossiblePadding := len(buf) - baseSize - 2
+	if maxPossiblePadding > 255 {
+		maxPossiblePadding = 255
+	}
+
+	padLen := uint64(0)
+	if maxPossiblePadding > 0 {
+		padLen = uint64(rand.IntN(maxPossiblePadding + 1))
 	}
 
 	binary.BigEndian.PutUint32(buf, m.SessionID)
