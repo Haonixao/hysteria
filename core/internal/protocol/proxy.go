@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 
 	"github.com/apernet/hysteria/core/v2/errors"
 
@@ -176,23 +177,41 @@ func (m *UDPMessage) Size() int {
 }
 
 func (m *UDPMessage) Serialize(buf []byte) int {
-	// Make sure the buffer is big enough
-	if len(buf) < m.Size() {
+	padLen := uint64(0)
+	if len(m.Data) < 1100 { // Only add padding if packet is not near MTU
+		padLen = uint64(rand.IntN(65)) // 0-64 bytes of padding
+	}
+
+	headerSize := m.HeaderSize()
+	paddingVarintLen := int(quicvarint.Len(padLen))
+	
+	totalSize := headerSize + paddingVarintLen + int(padLen) + len(m.Data)
+	if len(buf) < totalSize {
 		return -1
 	}
+
 	binary.BigEndian.PutUint32(buf, m.SessionID)
 	binary.BigEndian.PutUint16(buf[4:], m.PacketID)
 	buf[6] = m.FragID
 	buf[7] = m.FragCount
-	i := varintPut(buf[8:], uint64(len(m.Addr)))
-	i += copy(buf[8+i:], m.Addr)
-	i += copy(buf[8+i:], m.Data)
-	return 8 + i
+	i := 8 + varintPut(buf[8:], uint64(len(m.Addr)))
+	i += copy(buf[i:], m.Addr)
+	
+	// Записываем PaddingLen
+	i += varintPut(buf[i:], padLen)
+	
+	// Записываем Padding (просто пропускаем, там останется мусор)
+	i += int(padLen)
+	
+	// Записываем реальные Data
+	i += copy(buf[i:], m.Data)
+	
+	return i
 }
 
 func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 	m := &UDPMessage{}
-	buf := bytes.NewBuffer(msg)
+	buf := bytes.NewReader(msg)
 	if err := binary.Read(buf, binary.BigEndian, &m.SessionID); err != nil {
 		return nil, err
 	}
@@ -212,13 +231,32 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 	if lAddr == 0 || lAddr > MaxMessageLength {
 		return nil, errors.ProtocolError{Message: "invalid address length"}
 	}
-	bs := buf.Bytes()
-	if len(bs) <= int(lAddr) {
-		// We use <= instead of < here as we expect at least one byte of data after the address
-		return nil, errors.ProtocolError{Message: "invalid message length"}
+	
+	addrBuf := make([]byte, lAddr)
+	if _, err := io.ReadFull(buf, addrBuf); err != nil {
+		return nil, err
 	}
-	m.Addr = string(bs[:lAddr])
-	m.Data = bs[lAddr:]
+	m.Addr = string(addrBuf)
+	
+	// Читаем PaddingLen
+	padLen, err := quicvarint.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Пропускаем Padding
+	if padLen > 0 {
+		if _, err := io.CopyN(io.Discard, buf, int64(padLen)); err != nil {
+			return nil, err
+		}
+	}
+	
+	// Всё остальное - это Data
+	m.Data = make([]byte, buf.Len())
+	if _, err := io.ReadFull(buf, m.Data); err != nil {
+		return nil, err
+	}
+	
 	return m, nil
 }
 

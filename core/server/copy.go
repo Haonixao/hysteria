@@ -5,6 +5,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/apernet/hysteria/core/v2/internal/utils"
 )
 
 var errDisconnect = errors.New("traffic logger requested disconnect")
@@ -44,16 +46,17 @@ func copyBufferLog(dst io.Writer, src io.Reader, log func(n uint64) bool) error 
 }
 
 func copyTwoWayEx(id string, serverRw, remoteRw io.ReadWriter, l TrafficLogger, stats *StreamStats) error {
+	framedServerRw := &utils.FramedReadWriter{RW: serverRw}
 	errChan := make(chan error, 2)
 	go func() {
-		errChan <- copyBufferLog(serverRw, remoteRw, func(n uint64) bool {
+		errChan <- copyBufferLog(framedServerRw, remoteRw, func(n uint64) bool {
 			stats.LastActiveTime.Store(time.Now())
 			stats.Rx.Add(n)
 			return l.LogTraffic(id, 0, n)
 		})
 	}()
 	go func() {
-		errChan <- copyBufferLog(remoteRw, serverRw, func(n uint64) bool {
+		errChan <- copyBufferLog(remoteRw, framedServerRw, func(n uint64) bool {
 			stats.LastActiveTime.Store(time.Now())
 			stats.Tx.Add(n)
 			return l.LogTraffic(id, n, 0)
@@ -66,13 +69,14 @@ func copyTwoWayEx(id string, serverRw, remoteRw io.ReadWriter, l TrafficLogger, 
 // copyTwoWay is the "fast-path" version of copyTwoWayEx that does not log traffic or update stream stats.
 // It uses the built-in io.Copy instead of our own copyBufferLog.
 func copyTwoWay(serverRw, remoteRw io.ReadWriter) error {
+	framedServerRw := &utils.FramedReadWriter{RW: serverRw}
 	errChan := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(serverRw, remoteRw)
+		_, err := io.Copy(framedServerRw, remoteRw)
 		errChan <- err
 	}()
 	go func() {
-		_, err := io.Copy(remoteRw, serverRw)
+		_, err := io.Copy(remoteRw, framedServerRw)
 		errChan <- err
 	}()
 	// Block until one of the two goroutines returns

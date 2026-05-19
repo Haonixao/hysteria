@@ -242,6 +242,7 @@ func (c *clientImpl) TCP(addr string) (net.Conn, error) {
 		PseudoLocalAddr:  c.conn.LocalAddr(),
 		PseudoRemoteAddr: c.conn.RemoteAddr(),
 		Established:      true,
+		Framed:           &utils.FramedReadWriter{RW: stream},
 	}, nil
 }
 
@@ -281,6 +282,7 @@ type tcpConn struct {
 	PseudoLocalAddr  net.Addr
 	PseudoRemoteAddr net.Addr
 	Established      bool
+	Framed           *utils.FramedReadWriter
 }
 
 func (c *tcpConn) Read(b []byte) (n int, err error) {
@@ -295,11 +297,17 @@ func (c *tcpConn) Read(b []byte) (n int, err error) {
 		}
 		c.Established = true
 	}
-	return c.Orig.Read(b)
+	if c.Framed == nil {
+		c.Framed = &utils.FramedReadWriter{RW: c.Orig}
+	}
+	return c.Framed.Read(b)
 }
 
 func (c *tcpConn) Write(b []byte) (n int, err error) {
-	return c.Orig.Write(b)
+	if c.Framed == nil {
+		c.Framed = &utils.FramedReadWriter{RW: c.Orig}
+	}
+	return c.Framed.Write(b)
 }
 
 func (c *tcpConn) Close() error {
