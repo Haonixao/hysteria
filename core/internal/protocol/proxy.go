@@ -187,11 +187,16 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 		return -1
 	}
 
-	// Вычисляем максимально возможный паддинг
-	// Оставляем 2 байта запаса для безопасности
-	maxPossiblePadding := len(buf) - baseSize - 2
+	// ЖЕСТКИЙ ЛИМИТ: Мы не должны превышать MaxDatagramFrameSize (1200)
+	// quic-go добавит еще 3 байта заголовка фрейма, поэтому целимся в 1190.
+	const quicSafeLimit = MaxDatagramFrameSize - 10 
+	
+	maxPossiblePadding := quicSafeLimit - baseSize
 	if maxPossiblePadding > 255 {
 		maxPossiblePadding = 255
+	}
+	if maxPossiblePadding < 0 {
+		maxPossiblePadding = 0
 	}
 
 	padLen := uint64(0)
@@ -209,7 +214,7 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 	// Записываем PaddingLen
 	i += varintPut(buf[i:], padLen)
 	
-	// Записываем Padding (просто пропускаем, там останется мусор)
+	// Записываем Padding (пропускаем мусор)
 	i += int(padLen)
 	
 	// Записываем реальные Data
