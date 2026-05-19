@@ -59,6 +59,7 @@ func NewServer(config *Config) (Server, error) {
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
 		AssumePeerMaxDatagramFrameSize: protocol.MaxDatagramFrameSize,
+		OmitMaxDatagramFrameSize:       false,
 		DisablePathManager:             true,
 	}
 	tr := &quic.Transport{Conn: config.Conn}

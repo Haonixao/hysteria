@@ -28,6 +28,10 @@ func (c *mockHyClient) UDP() (client.HyUDPConn, error) {
 	return nil, errors.New("not implemented")
 }
 
+func (c *mockHyClient) IsClosed() bool {
+	return false
+}
+
 func (c *mockHyClient) Close() error {
 	return nil
 }

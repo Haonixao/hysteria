@@ -10,6 +10,10 @@ import (
 
 type MockEchoHyClient struct{}
 
+func (c *MockEchoHyClient) IsClosed() bool {
+	return false
+}
+
 func (c *MockEchoHyClient) TCP(addr string) (net.Conn, error) {
 	return &mockEchoTCPConn{
 		BufChan: make(chan []byte, 10),

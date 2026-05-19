@@ -27,6 +27,7 @@ type Client interface {
 	TCP(addr string) (net.Conn, error)
 	UDP() (HyUDPConn, error)
 	Close() error
+	IsClosed() bool
 }
 
 type HyUDPConn interface {
@@ -105,7 +106,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		DisablePathMTUDiscovery:        c.config.QUICConfig.DisablePathMTUDiscovery,
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
-		OmitMaxDatagramFrameSize:       true,
+		OmitMaxDatagramFrameSize:       false,
 		DisablePathManager:             true,
 	}
 
@@ -258,6 +259,10 @@ func (c *clientImpl) Close() error {
 	_ = c.tr.Close()
 	_ = c.pktConn.Close()
 	return nil
+}
+
+func (c *clientImpl) IsClosed() bool {
+	return c.conn == nil || c.conn.Context().Err() != nil
 }
 
 var nonPermanentErrors = []error{

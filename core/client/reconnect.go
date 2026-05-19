@@ -35,6 +35,10 @@ func NewReconnectableClient(configFunc func() (*Config, error), connectedFunc fu
 	return rc, nil
 }
 
+func (rc *reconnectableClientImpl) IsClosed() bool {
+	return rc.client.IsClosed() || rc.closed
+}
+
 func (rc *reconnectableClientImpl) reconnect() error {
 	if rc.client != nil {
 		_ = rc.client.Close()
