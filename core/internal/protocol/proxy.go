@@ -169,7 +169,8 @@ type UDPMessage struct {
 
 func (m *UDPMessage) HeaderSize() int {
 	lAddr := len(m.Addr)
-	return 4 + 2 + 1 + 1 + int(quicvarint.Len(uint64(lAddr))) + lAddr
+	// 4 (SessionID) + 2 (PacketID) + 1 (FragID) + 1 (FragCount) + varint(lAddr) + lAddr + 1 (min varint for PaddingLen)
+	return 8 + int(quicvarint.Len(uint64(lAddr))) + lAddr + 1
 }
 
 func (m *UDPMessage) Size() int {
@@ -177,31 +178,38 @@ func (m *UDPMessage) Size() int {
 }
 
 func (m *UDPMessage) Serialize(buf []byte) int {
-	headerSize := m.HeaderSize()
+	hSize := m.HeaderSize()
 	dataLen := len(m.Data)
-	
-	// Базовый размер без паддинга: заголовок + 1 байт (PaddingLen varint) + данные
-	baseSize := headerSize + 1 + dataLen
-	
-	if len(buf) < baseSize {
-		return -1
-	}
 
-	// ЖЕСТКИЙ ЛИМИТ: Мы не должны превышать MaxDatagramFrameSize (1200)
-	// quic-go добавит еще 3 байта заголовка фрейма, поэтому целимся в 1190.
-	const quicSafeLimit = MaxDatagramFrameSize - 10 
-	
-	maxPossiblePadding := quicSafeLimit - baseSize
-	if maxPossiblePadding > 255 {
-		maxPossiblePadding = 255
+	// Безопасный лимит для паддинга (стараемся не превышать 1150 байт)
+	const targetLimit = 1150
+
+	maxPadding := 0
+	if targetLimit > (hSize + dataLen) {
+		maxPadding = targetLimit - (hSize + dataLen)
 	}
-	if maxPossiblePadding < 0 {
-		maxPossiblePadding = 0
+	if maxPadding > 255 {
+		maxPadding = 255
 	}
 
 	padLen := uint64(0)
-	if maxPossiblePadding > 0 {
-		padLen = uint64(rand.IntN(maxPossiblePadding + 1))
+	if maxPadding > 0 {
+		padLen = uint64(rand.IntN(maxPadding + 1))
+	}
+
+	// Проверяем, поместимся ли в буфер (MaxUDPSize обычно 4096, так что проблем быть не должно)
+	// Учитываем возможный дополнительный байт для varint(padLen) если он > 63
+	padVarintSize := int(quicvarint.Len(padLen))
+	totalSize := hSize + (padVarintSize - 1) + int(padLen) + dataLen
+
+	if len(buf) < totalSize {
+		// Если не влезаем с паддингом, пробуем без него
+		padLen = 0
+		padVarintSize = 1
+		totalSize = hSize + dataLen
+		if len(buf) < totalSize {
+			return -1
+		}
 	}
 
 	binary.BigEndian.PutUint32(buf, m.SessionID)
@@ -210,16 +218,17 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 	buf[7] = m.FragCount
 	i := 8 + varintPut(buf[8:], uint64(len(m.Addr)))
 	i += copy(buf[i:], m.Addr)
-	
+
 	// Записываем PaddingLen
 	i += varintPut(buf[i:], padLen)
-	
-	// Записываем Padding (пропускаем мусор)
+
+	// Записываем Padding (мусор)
+	// В целях производительности просто смещаем индекс, не зануляя/не заполняя рандомом
 	i += int(padLen)
-	
+
 	// Записываем реальные Data
 	i += copy(buf[i:], m.Data)
-	
+
 	return i
 }
 
