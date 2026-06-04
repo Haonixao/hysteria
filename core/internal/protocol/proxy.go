@@ -2,10 +2,10 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math/rand/v2"
 
 	"github.com/apernet/hysteria/core/v2/errors"
 
@@ -156,6 +156,8 @@ func WriteTCPResponse(w io.Writer, ok bool, msg string) error {
 // Fragment count (uint8)
 // Address length (QUIC varint)
 // Address (bytes)
+// Padding length (QUIC varint)
+// Padding (random bytes)
 // Data...
 
 type UDPMessage struct {
@@ -183,6 +185,8 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 
 	// Целевой лимит для пакета с паддингом. 
 	// 1150 байт - безопасное значение, проходящее через большинство сетей.
+	// Padding strategy: используем crypto/rand для длины и для байт паддинга
+	// (аналогично FramedReadWriter и требованиям в docs/protocols/hysteria.md).
 	const targetLimit = 1150
 
 	padLen := uint64(0)
@@ -191,7 +195,19 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 		if maxPadding > 255 {
 			maxPadding = 255
 		}
-		padLen = uint64(rand.IntN(maxPadding + 1))
+		if maxPadding > 0 {
+			var rb [1]byte
+			if _, err := rand.Read(rb[:]); err == nil {
+				if maxPadding >= 255 {
+					// 255 means we want full 0-255 range. rb[0] is already 0-255,
+					// uint8(255+1) would underflow to 0 → %0 panic. Use value directly.
+					padLen = uint64(rb[0])
+				} else {
+					padLen = uint64(rb[0] % uint8(maxPadding+1))
+				}
+			}
+			// on rand failure: keep padLen=0 (safe, no padding)
+		}
 	}
 
 	// Итоговый размер
@@ -212,8 +228,19 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 
 	// Записываем PaddingLen
 	i += varintPut(buf[i:], padLen)
-	// Пропускаем Padding
+
+	// Заполняем область Padding реальными случайными байтами через crypto/rand.
+	// Раньше здесь было просто "i += int(padLen)" — в буфер попадали нули (от make)
+	// или остатки от предыдущих пакетов при переиспользовании SendBuf/msgBuf.
+	// Теперь padding — настоящий шум, как заявлено в документации Umbrella.
+	if padLen > 0 {
+		if _, err := rand.Read(buf[i : i+int(padLen)]); err != nil {
+			// crypto/rand failure is extremely rare. Do not fail the send.
+			// Padding area will contain zeros or stale data, but packet is still sent.
+		}
+	}
 	i += int(padLen)
+
 	// Записываем Data
 	i += copy(buf[i:], m.Data)
 
@@ -242,13 +269,13 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 	if lAddr > uint64(len(msg)) { // Базовая проверка на безумные значения
 		return nil, errors.ProtocolError{Message: "invalid address length"}
 	}
-	
+
 	addrBuf := make([]byte, lAddr)
 	if _, err := io.ReadFull(buf, addrBuf); err != nil {
 		return nil, err
 	}
 	m.Addr = string(addrBuf)
-	
+
 	// Пытаемся прочитать PaddingLen. 
 	// Если данных больше нет, значит это старый формат или пакет без данных и паддинга.
 	if buf.Len() == 0 {
@@ -264,7 +291,7 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 		// но мы контролируем обе стороны.
 		return nil, err
 	}
-	
+
 	// Пропускаем Padding
 	if padLen > 0 {
 		if uint64(buf.Len()) < padLen {
@@ -274,7 +301,7 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 			return nil, err
 		}
 	}
-	
+
 	// Всё остальное - это Data
 	remaining := buf.Len()
 	if remaining > 0 {
@@ -285,7 +312,7 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 	} else {
 		m.Data = []byte{}
 	}
-	
+
 	return m, nil
 }
 
