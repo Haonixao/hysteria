@@ -7,16 +7,12 @@ import (
 	"time"
 )
 
-const udpBufferSize = 2048
+const udpBufferSize = 2048 // QUIC packets are at most 1500 bytes long, so 2k should be more than enough
 
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, udpBufferSize)
-	},
-}
-
-// Obfuscator is the interface that wraps the Obfuscate and Deobfuscate methods.
-type Obfuscator interface {
+// obfuscator wraps a per-packet, length-preserving cipher.
+// Obfuscate / Deobfuscate return the number of bytes written to out.
+// If a packet is not valid, the methods should return 0.
+type obfuscator interface {
 	Obfuscate(in, out []byte) int
 	Deobfuscate(in, out []byte) int
 }
@@ -25,11 +21,19 @@ var _ net.PacketConn = (*obfsPacketConn)(nil)
 
 type obfsPacketConn struct {
 	Conn net.PacketConn
-	Obfs Obfuscator
+	Obfs obfuscator
+
+	readBuf    []byte
+	readMutex  sync.Mutex
+	writeBuf   []byte
+	writeMutex sync.Mutex
 }
 
 // udpLikePacketConn is the subset of *net.UDPConn methods that quic-go relies
-// on for UDP-specific optimizations.
+// on for UDP-specific optimizations (DF/PMTU detection and recv/send buffer
+// sizing). Anything that satisfies this interface — including a wrapper such
+// as realm.PunchPacketConn that proxies these calls down to a *net.UDPConn —
+// will keep those optimizations when wrapped in obfs.
 type udpLikePacketConn interface {
 	net.PacketConn
 	SyscallConn() (syscall.RawConn, error)
@@ -37,51 +41,57 @@ type udpLikePacketConn interface {
 	SetWriteBuffer(int) error
 }
 
+// obfsPacketConnUDP is a special case of obfsPacketConn that wraps a
+// UDP-flavored PacketConn. We pass additional methods through to quic-go to
+// enable UDP-specific optimizations.
 type obfsPacketConnUDP struct {
 	*obfsPacketConn
 	UDPConn udpLikePacketConn
 }
 
-// WrapPacketConn enables obfuscation on a net.PacketConn.
-func WrapPacketConn(conn net.PacketConn, obfs Obfuscator) net.PacketConn {
+// wrapPacketConn enables per-packet obfuscation on a net.PacketConn.
+// The obfuscation is transparent to the caller - the n bytes returned by
+// ReadFrom and WriteTo are the number of original bytes, not after
+// obfuscation/deobfuscation.
+func wrapPacketConn(conn net.PacketConn, ob obfuscator) net.PacketConn {
 	opc := &obfsPacketConn{
-		Conn: conn,
-		Obfs: obfs,
+		Conn:     conn,
+		Obfs:     ob,
+		readBuf:  make([]byte, udpBufferSize),
+		writeBuf: make([]byte, udpBufferSize),
 	}
 	if udpConn, ok := conn.(udpLikePacketConn); ok {
 		return &obfsPacketConnUDP{
 			obfsPacketConn: opc,
 			UDPConn:        udpConn,
 		}
+	} else {
+		return opc
 	}
-	return opc
 }
 
 func (c *obfsPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	buf := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buf)
-
 	for {
-		n, addr, err = c.Conn.ReadFrom(buf)
+		c.readMutex.Lock()
+		n, addr, err = c.Conn.ReadFrom(c.readBuf)
 		if n <= 0 {
+			c.readMutex.Unlock()
 			return n, addr, err
 		}
-		n = c.Obfs.Deobfuscate(buf[:n], p)
+		n = c.Obfs.Deobfuscate(c.readBuf[:n], p)
+		c.readMutex.Unlock()
 		if n > 0 || err != nil {
 			return n, addr, err
 		}
+		// Invalid packet, try again
 	}
 }
 
 func (c *obfsPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	buf := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buf)
-
-	nn := c.Obfs.Obfuscate(p, buf)
-	if nn <= 0 {
-		return 0, nil
-	}
-	_, err = c.Conn.WriteTo(buf[:nn], addr)
+	c.writeMutex.Lock()
+	nn := c.Obfs.Obfuscate(p, c.writeBuf)
+	_, err = c.Conn.WriteTo(c.writeBuf[:nn], addr)
+	c.writeMutex.Unlock()
 	if err == nil {
 		n = len(p)
 	}
@@ -107,6 +117,8 @@ func (c *obfsPacketConn) SetReadDeadline(t time.Time) error {
 func (c *obfsPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(t)
 }
+
+// UDP-specific methods below
 
 func (c *obfsPacketConnUDP) SetReadBuffer(bytes int) error {
 	return c.UDPConn.SetReadBuffer(bytes)
