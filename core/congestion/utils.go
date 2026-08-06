@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/apernet/hysteria/core/v2/internal/congestion/bbr"
-	"github.com/apernet/hysteria/core/v2/internal/congestion/brutal"
+	"github.com/apernet/hysteria/core/v2/congestion/bbr"
+	"github.com/apernet/hysteria/core/v2/congestion/brutal"
 	"github.com/apernet/quic-go"
 )
 
