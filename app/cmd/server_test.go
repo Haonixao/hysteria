@@ -94,6 +94,14 @@ func TestServerConfig(t *testing.T) {
 			MaxIdleTimeout:              999 * time.Second,
 			MaxIncomingStreams:          256,
 			DisablePathMTUDiscovery:     true,
+			DisableStatelessReset:       true,
+		},
+		Mimic: mimicConfig{
+			Enabled:   true,
+			Interface: "eth0",
+			XDPMode:   "skb",
+			Path:      "/usr/bin/mimic",
+			ExtraArgs: []string{"--padding", "random"},
 		},
 		Congestion: serverConfigCongestion{
 			Type:       "reno",

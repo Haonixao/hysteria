@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
 	"errors"
 	"math/rand"
@@ -64,7 +65,24 @@ func NewServer(config *Config) (Server, error) {
 		OmitMaxDatagramFrameSize:       false,
 		DisablePathManager:             true,
 	}
-	tr := &quic.Transport{Conn: config.Conn}
+	tr := &quic.Transport{
+		Conn:       config.Conn,
+		DisableGSO: config.QUICConfig.DisableGSO,
+	}
+	// A nil key means quic-go never sends stateless resets. Clients then have to
+	// wait for the idle timeout to notice the server is gone, so keep them on
+	// unless the user explicitly asks otherwise.
+	if !config.QUICConfig.DisableStatelessReset {
+		srk := config.StatelessResetKey
+		if srk == nil {
+			var k quic.StatelessResetKey
+			if _, err := crand.Read(k[:]); err != nil {
+				return nil, err
+			}
+			srk = &k
+		}
+		tr.StatelessResetKey = srk
+	}
 	listener, err := tr.Listen(tlsConfig, quicConfig)
 	if err != nil {
 		err = errors.Join(err, tr.Close(), config.Conn.Close())
@@ -389,11 +407,11 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	return io.Conn.SendDatagram(buf[:msgN])
 }
 
-func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
-		return io.RequestHook.UDP(data, reqAddr)
+		return io.RequestHook.UDP(packets, reqAddr)
 	} else {
-		return nil
+		return true, nil
 	}
 }
 

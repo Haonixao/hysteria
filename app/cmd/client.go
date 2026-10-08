@@ -28,6 +28,7 @@ import (
 
 	"github.com/apernet/hysteria/app/v2/internal/forwarding"
 	"github.com/apernet/hysteria/app/v2/internal/http"
+	"github.com/apernet/hysteria/app/v2/internal/mimic"
 	"github.com/apernet/hysteria/app/v2/internal/proxymux"
 	"github.com/apernet/hysteria/app/v2/internal/redirect"
 	"github.com/apernet/hysteria/app/v2/internal/sockopts"
@@ -78,6 +79,7 @@ type clientConfig struct {
 	Obfs          clientConfigObfs       `mapstructure:"obfs"`
 	TLS           clientConfigTLS        `mapstructure:"tls"`
 	QUIC          clientConfigQUIC       `mapstructure:"quic"`
+	Mimic         mimicConfig            `mapstructure:"mimic"`
 	Congestion    clientConfigCongestion `mapstructure:"congestion"`
 	Bandwidth     clientConfigBandwidth  `mapstructure:"bandwidth"`
 	FastOpen      bool                   `mapstructure:"fastOpen"`
@@ -90,6 +92,14 @@ type clientConfig struct {
 	UDPTProxy     *udpTProxyConfig       `mapstructure:"udpTProxy"`
 	TCPRedirect   *tcpRedirectConfig     `mapstructure:"tcpRedirect"`
 	TUN           *tunConfig             `mapstructure:"tun"`
+}
+
+type mimicConfig struct {
+	Enabled   bool     `mapstructure:"enabled"`
+	Interface string   `mapstructure:"interface"`
+	XDPMode   string   `mapstructure:"xdpMode"`
+	Path      string   `mapstructure:"path"`
+	ExtraArgs []string `mapstructure:"extraArgs"`
 }
 
 type clientConfigRealm struct {
@@ -227,7 +237,6 @@ type tunConfig struct {
 		IPv6 string `mapstructure:"ipv6"`
 	} `mapstructure:"address"`
 	Route *struct {
-		Strict      bool     `mapstructure:"strict"`
 		IPv4        []string `mapstructure:"ipv4"`
 		IPv6        []string `mapstructure:"ipv6"`
 		IPv4Exclude []string `mapstructure:"ipv4Exclude"`
@@ -435,6 +444,19 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 	return nil
 }
 
+func (c *clientConfig) validateMimic() error {
+	if !c.Mimic.Enabled {
+		return nil
+	}
+	// Mimic matches traffic by a single ip:port. Port hopping moves the server
+	// port over a range, which would need one filter per port.
+	_, port, _ := parseServerAddrString(c.Server)
+	if isPortHoppingPort(port) {
+		return configError{Field: "mimic", Err: errors.New("cannot be used with port hopping")}
+	}
+	return nil
+}
+
 func (c *clientConfig) fillQUICConfig(hyConfig *client.Config) error {
 	hyConfig.QUICConfig = client.QUICConfig{
 		InitialStreamReceiveWindow:     c.QUIC.InitStreamReceiveWindow,
@@ -445,6 +467,9 @@ func (c *clientConfig) fillQUICConfig(hyConfig *client.Config) error {
 		KeepAlivePeriod:                c.QUIC.KeepAlivePeriod,
 		DisablePathMTUDiscovery:        c.QUIC.DisablePathMTUDiscovery,
 		DisableChromeParrot:            c.QUIC.DisableChromeParrot,
+		// Mimic rewrites packets after they leave the socket, which corrupts
+		// every segment but the first of a GSO batch.
+		DisableGSO: c.Mimic.Enabled,
 	}
 	return nil
 }
@@ -819,6 +844,12 @@ func runClient(v *viper.Viper) {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
 
+	if err := config.validateMimic(); err != nil {
+		logger.Fatal("failed to load client config", zap.Error(err))
+	}
+	mimicInst := config.startMimic()
+	defer mimicInst.Close()
+
 	c, err := client.NewReconnectableClient(
 		config.Config,
 		func(c client.Client, info *client.HandshakeInfo, count int) {
@@ -882,9 +913,18 @@ func runClient(v *viper.Viper) {
 			return clientTCPRedirect(*config.TCPRedirect, c)
 		})
 	}
+	var tunServer *tun.Server
 	if config.TUN != nil {
+		tunServer, err = newTUNServer(*config.TUN, c)
+		if err != nil {
+			_ = c.Close()
+			logger.Fatal("failed to load client config", zap.Error(err))
+		}
+		// The TUN adds routes and rules to the system, remove them on exit
+		defer tunServer.Close()
 		runner.Add("TUN", func() error {
-			return clientTUN(*config.TUN, c)
+			logger.Info("TUN listening", zap.String("interface", config.TUN.Name))
+			return tunServer.Serve()
 		})
 	}
 
@@ -904,7 +944,11 @@ func runClient(v *viper.Viper) {
 		if r.OK {
 			logger.Info(r.Msg)
 		} else {
-			_ = c.Close() // Close the client here as Fatal will exit the program without running defer
+			// Close these here as Fatal will exit the program without running defer
+			if tunServer != nil {
+				_ = tunServer.Close()
+			}
+			_ = c.Close()
 			if r.Err != nil {
 				logger.Fatal(r.Msg, zap.Error(r.Err))
 			} else {
@@ -1117,34 +1161,33 @@ func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
 	return p.ListenAndServe(laddr)
 }
 
-func clientTUN(config tunConfig, c client.Client) error {
+func newTUNServer(config tunConfig, c client.Client) (*tun.Server, error) {
 	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
 	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
-		logger.Error("TUN is not supported on this platform", zap.String("platform", runtime.GOOS))
+		return nil, configError{Field: "tun", Err: fmt.Errorf("TUN is not supported on %s", runtime.GOOS)}
 	}
 	if config.Name == "" {
-		return configError{Field: "name", Err: errors.New("name is empty")}
+		return nil, configError{Field: "tun.name", Err: errors.New("name is empty")}
 	}
 	if config.MTU == 0 {
 		config.MTU = 1500
 	}
-	timeout := int64(config.Timeout.Seconds())
-	if timeout == 0 {
-		timeout = 300
+	if config.Timeout <= 0 {
+		config.Timeout = 5 * time.Minute
 	}
 	if config.Address.IPv4 == "" {
 		config.Address.IPv4 = "100.100.100.101/30"
 	}
 	prefix4, err := netip.ParsePrefix(config.Address.IPv4)
 	if err != nil {
-		return configError{Field: "address.ipv4", Err: err}
+		return nil, configError{Field: "tun.address.ipv4", Err: err}
 	}
 	if config.Address.IPv6 == "" {
 		config.Address.IPv6 = "2001::ffff:ffff:ffff:fff1/126"
 	}
 	prefix6, err := netip.ParsePrefix(config.Address.IPv6)
 	if err != nil {
-		return configError{Field: "address.ipv6", Err: err}
+		return nil, configError{Field: "tun.address.ipv6", Err: err}
 	}
 	server := &tun.Server{
 		HyClient:     c,
@@ -1152,13 +1195,12 @@ func clientTUN(config tunConfig, c client.Client) error {
 		Logger:       logger,
 		IfName:       config.Name,
 		MTU:          config.MTU,
-		Timeout:      timeout,
+		Timeout:      config.Timeout,
 		Inet4Address: []netip.Prefix{prefix4},
 		Inet6Address: []netip.Prefix{prefix6},
 	}
 	if config.Route != nil {
 		server.AutoRoute = true
-		server.StructRoute = config.Route.Strict
 
 		parsePrefixes := func(field string, ss []string) ([]netip.Prefix, error) {
 			var prefixes []netip.Prefix
@@ -1182,25 +1224,24 @@ func clientTUN(config tunConfig, c client.Client) error {
 			return prefixes, nil
 		}
 
-		server.Inet4RouteAddress, err = parsePrefixes("route.ipv4", config.Route.IPv4)
+		server.Inet4RouteAddress, err = parsePrefixes("tun.route.ipv4", config.Route.IPv4)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		server.Inet6RouteAddress, err = parsePrefixes("route.ipv6", config.Route.IPv6)
+		server.Inet6RouteAddress, err = parsePrefixes("tun.route.ipv6", config.Route.IPv6)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		server.Inet4RouteExcludeAddress, err = parsePrefixes("route.ipv4Exclude", config.Route.IPv4Exclude)
+		server.Inet4RouteExcludeAddress, err = parsePrefixes("tun.route.ipv4Exclude", config.Route.IPv4Exclude)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		server.Inet6RouteExcludeAddress, err = parsePrefixes("route.ipv6Exclude", config.Route.IPv6Exclude)
+		server.Inet6RouteExcludeAddress, err = parsePrefixes("tun.route.ipv6Exclude", config.Route.IPv6Exclude)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	logger.Info("TUN listening", zap.String("interface", config.Name))
-	return server.Serve()
+	return server, nil
 }
 
 // parseServerAddrString parses server address string.
@@ -1455,4 +1496,62 @@ func (l *tunLogger) UDPError(addr string, err error) {
 	} else {
 		logger.Warn("TUN UDP error", zap.String("addr", addr), zap.Error(err))
 	}
+}
+
+// startMimic brings Mimic up for this client, if enabled. Every command that
+// opens a connection needs this, not just "client": Mimic has to be attached
+// before the first packet, or the server sees plain UDP and drops it.
+func (c *clientConfig) startMimic() *mimic.Instance {
+	if err := c.validateMimic(); err != nil {
+		logger.Fatal("failed to load client config", zap.Error(err))
+	}
+	if !c.Mimic.Enabled {
+		return nil
+	}
+	addrs, err := c.mimicServerAddrs()
+	if err != nil {
+		logger.Fatal("failed to resolve server address for mimic", zap.Error(err))
+	}
+	inst, err := mimic.Start(
+		mimic.Config{
+			Enabled:   c.Mimic.Enabled,
+			Interface: c.Mimic.Interface,
+			XDPMode:   c.Mimic.XDPMode,
+			Path:      c.Mimic.Path,
+			ExtraArgs: c.Mimic.ExtraArgs,
+		},
+		mimic.RoleClient, addrs, logger,
+		func(err error) { logger.Fatal("mimic stopped", zap.Error(err)) },
+	)
+	if err != nil {
+		logger.Fatal("failed to start mimic", zap.Error(err))
+	}
+	return inst
+}
+
+// mimicServerAddrs resolves the server address for Mimic's filters. Mimic needs
+// literal ip:port, and a name can resolve to several addresses across both
+// families, so every one of them gets a filter: the client re-resolves on each
+// reconnect and may pick a different one than it did at startup.
+func (c *clientConfig) mimicServerAddrs() ([]*net.UDPAddr, error) {
+	host, portStr, hostPort := parseServerAddrString(c.Server)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server port %q: %w", portStr, err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return []*net.UDPAddr{{IP: ip, Port: port}}, nil
+	}
+	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses for %s", hostPort)
+	}
+	addrs := make([]*net.UDPAddr, 0, len(ips))
+	for _, ip := range ips {
+		addrs = append(addrs, &net.UDPAddr{IP: ip, Port: port})
+	}
+	return addrs, nil
 }

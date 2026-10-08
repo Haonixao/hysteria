@@ -54,6 +54,15 @@ quic:
     fwmark: 1234
     fdControlUnixSocket: test.sock
 
+mimic:
+  enabled: true
+  interface: eth0
+  xdpMode: skb
+  path: /usr/bin/mimic
+  extraArgs:
+    - --padding
+    - random
+
 congestion:
   type: bbr
   bbrProfile: aggressive
@@ -106,7 +115,6 @@ tun:
     ipv4: 100.100.100.101/30
     ipv6: 2001::ffff:ffff:ffff:fff1/126
   route:
-    strict: true
     ipv4: [ 0.0.0.0/0 ]
     ipv6: [ "2000::/3" ]
     ipv4Exclude: [ 192.0.2.1/32 ]
